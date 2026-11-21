@@ -1,6 +1,6 @@
 # Phone Farm iOS
 
-> By [An Nayal](https://annayal.com) · used at [Handler](https://gethandler.ai) · more free tools at [annayal.com/open-source](https://annayal.com/open-source)
+> Built at [Agniverse](https://agniverse.co), by [An Nayal](https://annayal.com) · used at [Handler](https://gethandler.ai) · more free tools at [annayal.com/open-source](https://annayal.com/open-source)
 
 An open-source, standalone application for operating physical iOS devices and running scheduled TikTok workflows. It includes guided device registration, WDA/Appium supervision, live video and remote input, PostgreSQL-backed scheduling, recurring jobs, uploads, execution history, the dashboard/API server, and a built-in TikTok automation plugin.
 
@@ -58,3 +58,5 @@ This repository uses GitHub-hosted CI only. Never connect production devices, Ap
 ```sh
 npm run check
 ```
+
+Built at [Agniverse](https://agniverse.co), by [An Nayal](https://annayal.com)
