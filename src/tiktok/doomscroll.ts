@@ -5,6 +5,13 @@ import { coordinateProfile, registeredAccounts } from './runtime-settings.js';
 import { switchTikTokAccount, tapCoordinate, setScreenSize } from './actions.js';
 import { detectEngagementControls } from './engagement-controls.js';
 import {
+    parseScreenIcons,
+    screenParserConfigFromEnv,
+    screenParserReady,
+    tiktokEngagementState,
+    type EngagementState,
+} from './screen-parser.js';
+import {
     PROFILES,
     clampToDeadline,
     decideLike,
@@ -57,6 +64,8 @@ const durationMinutes = boundedInteger('DOOMSCROLL_DURATION_MINUTES', 5, 1, 180)
 const likeEnabled = booleanEnv('DOOMSCROLL_LIKE_ENABLED', true);
 const saveEnabled = booleanEnv('DOOMSCROLL_SAVE_ENABLED', true);
 const switchAccountName = process.env.TIKTOK_SWITCH_ACCOUNT?.trim() || undefined;
+// Optional icon-detection service. Unset means the original behaviour.
+const screenParser = screenParserConfigFromEnv();
 const registeredDevice = (await loadRegisteredDevices()).find((device) => device.udid === udid);
 const coordinates = resolveDeviceCoordinates(coordinateProfile(registeredDevice), registeredDevice?.coordinates);
 setScreenSize(coordinates.screenSize);
@@ -81,6 +90,7 @@ const allowedAccounts = switchAccountName
 if (switchAccountName && !allowedAccounts.includes(switchAccountName)) {
     throw new Error(`TikTok account "${switchAccountName}" is not listed in devices.json for device ${udid}`);
 }
+let screenSize = coordinates.screenSize;
 let { x: likeX, y: likeY } = tiktokCoordinates.like;
 let { x: saveX, y: saveY } = tiktokCoordinates.save;
 const { x: swipeX, startY: swipeStartY, endY: swipeEndY, durationMs: swipeDurationMs } = tiktokCoordinates.swipe;
@@ -150,6 +160,31 @@ function interactionPauseMs(): number {
     return Math.round(200 + Math.random() * 400);
 }
 
+// After this many parser errors in a row the run stops asking it, so a dead
+// service costs a few seconds, not a timeout on every video.
+const MAX_PARSER_FAILURES = 3;
+const VERIFY_SETTLE_MS = 700;
+let parserActive = false;
+let parserFailures = 0;
+
+async function readEngagement(remoteControl: WdaRemoteControl): Promise<EngagementState | undefined> {
+    if (!screenParser || !parserActive) return undefined;
+    try {
+        const screenshot = await remoteControl.getScreenshot(udid!);
+        const icons = await parseScreenIcons(screenParser, screenshot);
+        parserFailures = 0;
+        return tiktokEngagementState(icons, screenSize, screenParser.minConfidence);
+    } catch (error) {
+        parserFailures += 1;
+        console.log(`Screen parser failed (${parserFailures}/${MAX_PARSER_FAILURES}); using fallback coordinates: ${error instanceof Error ? error.message : String(error)}`);
+        if (parserFailures >= MAX_PARSER_FAILURES) {
+            parserActive = false;
+            console.log('Screen parser disabled for the rest of this run');
+        }
+        return undefined;
+    }
+}
+
 async function doubleTapCoordinate(driver: Browser, x: number, y: number, label: string): Promise<void> {
     await tapCoordinate(driver, x, y, label);
     // Short, fixed gap so TikTok's gesture recognizer reads this as a
@@ -163,6 +198,12 @@ let videosViewed = 0;
 let swipes = 0;
 let likes = 0;
 let saves = 0;
+let parserLikes = 0;
+let parserSaves = 0;
+let likesConfirmed = 0;
+let savesConfirmed = 0;
+let alreadyLiked = 0;
+let alreadySaved = 0;
 const runStartedAt = Date.now();
 
 console.log(`Starting doomscroll: profile=${personality} requestedDurationMinutes=${durationMinutes} likeEnabled=${likeEnabled} saveEnabled=${saveEnabled}`);
@@ -204,6 +245,7 @@ try {
             remoteControl.getScreenshot(udid),
             remoteControl.getScreenInfo(udid),
         ]);
+        screenSize = screen.screenSize;
         const detected = await detectEngagementControls(screenshot, screen.scale);
         if (detected) {
             ({ x: likeX, y: likeY } = detected.like);
@@ -216,6 +258,13 @@ try {
         console.log(`Engagement control detection failed; using profile coordinates: ${error instanceof Error ? error.message : String(error)}`);
     }
 
+    if (screenParser) {
+        parserActive = await screenParserReady(screenParser);
+        console.log(parserActive
+            ? `Screen parser ready at ${screenParser.url}; like/save are located on every video`
+            : `Screen parser at ${screenParser.url} is not ready; using fallback coordinates for this run`);
+    }
+
     const deadline = Date.now() + durationMinutes * 60_000;
 
     while (!stopRequested && hasTimeRemaining(Date.now(), deadline)) {
@@ -223,19 +272,64 @@ try {
         videosViewed += 1;
         if (stopRequested || !hasTimeRemaining(Date.now(), deadline)) break;
 
+        // One parse per video serves both decisions; a confirmation parse
+        // after a tap replaces it, so save always sees the latest frame.
+        let engagement: EngagementState | undefined;
+        let engagementRead = false;
+        const currentEngagement = async (): Promise<EngagementState | undefined> => {
+            if (!engagementRead) {
+                engagement = await readEngagement(remoteControl);
+                engagementRead = true;
+            }
+            return engagement;
+        };
+        const confirmEngagement = async (): Promise<EngagementState | undefined> => {
+            await cancellableDelay(VERIFY_SETTLE_MS);
+            engagement = await readEngagement(remoteControl);
+            return engagement;
+        };
+
         if (likeEnabled && decideLike(profile)) {
             await cancellableDelay(clampToDeadline(Date.now(), deadline, interactionPauseMs()));
             if (stopRequested || !hasTimeRemaining(Date.now(), deadline)) break;
-            await doubleTapCoordinate(driver, likeX, likeY, 'Like');
-            likes += 1;
+            const like = (await currentEngagement())?.like;
+            if (stopRequested) break;
+            if (like?.active) {
+                alreadyLiked += 1;
+                console.log('Video is already liked; not tapping');
+            } else if (like) {
+                // The parser saw the unfilled heart, so one tap on the icon
+                // likes it. (A double-tap on the button itself would toggle.)
+                await tapCoordinate(driver, like.x, like.y, `Like (parser ${like.confidence.toFixed(2)})`);
+                likes += 1;
+                parserLikes += 1;
+                if ((await confirmEngagement())?.like?.active) likesConfirmed += 1;
+                else console.log('Like not confirmed on the next frame');
+            } else {
+                await doubleTapCoordinate(driver, likeX, likeY, 'Like');
+                likes += 1;
+            }
         }
         if (stopRequested || !hasTimeRemaining(Date.now(), deadline)) break;
 
         if (saveEnabled && decideSave(profile)) {
             await cancellableDelay(clampToDeadline(Date.now(), deadline, interactionPauseMs()));
             if (stopRequested || !hasTimeRemaining(Date.now(), deadline)) break;
-            await tapCoordinate(driver, saveX, saveY, 'Save');
-            saves += 1;
+            const save = (await currentEngagement())?.save;
+            if (stopRequested) break;
+            if (save?.active) {
+                alreadySaved += 1;
+                console.log('Video is already saved; not tapping');
+            } else if (save) {
+                await tapCoordinate(driver, save.x, save.y, `Save (parser ${save.confidence.toFixed(2)})`);
+                saves += 1;
+                parserSaves += 1;
+                if ((await confirmEngagement())?.save?.active) savesConfirmed += 1;
+                else console.log('Save not confirmed on the next frame');
+            } else {
+                await tapCoordinate(driver, saveX, saveY, 'Save');
+                saves += 1;
+            }
         }
         if (stopRequested || !hasTimeRemaining(Date.now(), deadline)) break;
 
@@ -288,6 +382,9 @@ try {
     const elapsedMs = Date.now() - runStartedAt;
     const reason = stopRequested ? 'stopped' : 'completed';
     console.log(`Finished doomscroll: videosViewed=${videosViewed} swipes=${swipes} likes=${likes} saves=${saves} elapsedMs=${elapsedMs} reason=${reason}`);
+    if (screenParser) {
+        console.log(`Screen parser: likes=${likesConfirmed}/${parserLikes} confirmed, saves=${savesConfirmed}/${parserSaves} confirmed, alreadyLiked=${alreadyLiked}, alreadySaved=${alreadySaved}, fallbackLikes=${likes - parserLikes}, fallbackSaves=${saves - parserSaves}`);
+    }
 } finally {
     if (driver) {
         await driver.deleteSession();
