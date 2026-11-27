@@ -13,6 +13,7 @@ import { loadRegisteredDevices, mutateRegisteredDevices, type RegisteredDevice }
 import { passcodeForDevice, setDevicePasscode } from './secrets.js';
 import { WdaRemoteControl } from './wda-remote.js';
 import { diagnoseWdaLaunchFailure } from './wda/diagnostics.js';
+import { isWdaConnectionLost, WDA_LOST_DURING_VERIFY } from './wda/connection-lost.js';
 
 export type RegistrationCheckState = 'pending' | 'checking' | 'blocked' | 'passed' | 'failed';
 export type RegistrationAction = 'refresh' | 'prepare' | 'verify' | 'finalize';
@@ -392,23 +393,24 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
             passcodeKeypadLayout: coordinatesForProfile(session.coordinateProfile).passcodeKeypad,
         });
         let driver: Browser | undefined;
+        const wdaUrl = `http://127.0.0.1:${session.wdaLocalPort}`;
+        const createDriver = () => remote({
+            hostname: process.env.APPIUM_HOST ?? '127.0.0.1',
+            port: Number(process.env.APPIUM_PORT ?? 4725),
+            path: '/',
+            logLevel: 'error',
+            capabilities: {
+                platformName: 'iOS',
+                'appium:automationName': 'XCUITest',
+                'appium:udid': session.device.udid,
+                'appium:bundleId': process.env.TIKTOK_BUNDLE_ID ?? 'com.zhiliaoapp.musically',
+                'appium:noReset': true,
+                'appium:forceAppLaunch': true,
+                'appium:webDriverAgentUrl': wdaUrl,
+            },
+        });
         try {
-            const appiumPort = Number(process.env.APPIUM_PORT ?? 4725);
-            driver = await remote({
-                hostname: process.env.APPIUM_HOST ?? '127.0.0.1',
-                port: appiumPort,
-                path: '/',
-                logLevel: 'error',
-                capabilities: {
-                    platformName: 'iOS',
-                    'appium:automationName': 'XCUITest',
-                    'appium:udid': session.device.udid,
-                    'appium:bundleId': process.env.TIKTOK_BUNDLE_ID ?? 'com.zhiliaoapp.musically',
-                    'appium:noReset': true,
-                    'appium:forceAppLaunch': true,
-                    'appium:webDriverAgentUrl': `http://127.0.0.1:${session.wdaLocalPort}`,
-                },
-            });
+            driver = await createDriver();
             session.checks.appium = check('passed', 'Appium attached to WDA and launched TikTok without resetting it');
             const stream = await control.getMjpegStream(session.device.udid);
             const reader = stream.body!.getReader();
@@ -417,15 +419,35 @@ export class DeviceRegistrationService implements DeviceRegistrationManager {
             if (first.done || !first.value?.length) throw new Error('The WDA video stream returned no frames');
             session.checks.video = check('passed', 'WDA returned a live MJPEG frame');
             const coordinates = coordinatesForProfile(session.coordinateProfile).tiktok;
-            const beforeTouch = await control.getScreenshot(session.device.udid);
-            await tapCoordinate(driver, coordinates.profileTab.x, coordinates.profileTab.y, 'Profile tab readiness check', { jitter: false });
-            await driver.pause(1_000);
-            const profileScreen = await control.getScreenshot(session.device.udid);
-            if (profileScreen.equals(beforeTouch)) throw new Error('The Profile tap produced no visible screen change');
-            await tapCoordinate(driver, coordinates.homeTab.x, coordinates.homeTab.y, 'Home tab readiness check', { jitter: false });
-            await driver.pause(1_000);
-            const homeScreen = await control.getScreenshot(session.device.udid);
-            if (homeScreen.equals(profileScreen)) throw new Error('The Home tap produced no visible screen change');
+            const checkTouch = async (touchDriver: Browser) => {
+                const beforeTouch = await control.getScreenshot(session.device.udid);
+                await tapCoordinate(touchDriver, coordinates.profileTab.x, coordinates.profileTab.y, 'Profile tab readiness check', { jitter: false });
+                await touchDriver.pause(1_000);
+                const profileScreen = await control.getScreenshot(session.device.udid);
+                if (profileScreen.equals(beforeTouch)) throw new Error('The Profile tap produced no visible screen change');
+                await tapCoordinate(touchDriver, coordinates.homeTab.x, coordinates.homeTab.y, 'Home tab readiness check', { jitter: false });
+                await touchDriver.pause(1_000);
+                const homeScreen = await control.getScreenshot(session.device.udid);
+                if (homeScreen.equals(profileScreen)) throw new Error('The Home tap produced no visible screen change');
+            };
+            try {
+                await checkTouch(driver);
+            } catch (error) {
+                if (!isWdaConnectionLost(error)) throw error;
+                // WDA exited on the phone and its port forward closed. Bring
+                // it back once, with a fresh Appium session, before failing.
+                this.log(session, 'WDA dropped during the touch check; restarting it and retrying once');
+                if (!session.supervisor) await this.startSupervisor(session);
+                if (!await this.waitForEndpoint(`${wdaUrl}/status`, 120_000)) throw new Error(WDA_LOST_DURING_VERIFY);
+                await driver.deleteSession().catch(() => undefined);
+                driver = undefined;
+                driver = await createDriver();
+                try {
+                    await checkTouch(driver);
+                } catch (retryError) {
+                    throw isWdaConnectionLost(retryError) ? new Error(WDA_LOST_DURING_VERIFY) : retryError;
+                }
+            }
             session.checks.touch = check('passed', 'Profile and Home taps both produced visible screen changes');
             const accountCoordinates = {
                 profileTabX: coordinates.profileTab.x,

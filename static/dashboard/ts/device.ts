@@ -271,7 +271,7 @@ async function pollConnection(reloadWhenReady = false): Promise<void> {
             return;
         }
         const appium = connection.appium === 'ready' ? '' : ' Appium is unavailable.';
-        setStatus(`${connection.message}.${appium}`.replace('..', '.'), connection.wda === 'error' ? 'error' : '');
+        setStatus(`${connection.message}.${appium}`.replace(/\.{2,}/g, '.'), connection.wda === 'error' ? 'error' : '');
         connectionPoll = window.setTimeout(() => void pollConnection(reloadWhenReady), 2_000);
     } catch (error) {
         setStatus(errorMessage(error), 'error');

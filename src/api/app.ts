@@ -94,6 +94,14 @@ async function registeredWithStatus() {
     }));
 }
 
+// Linear-time trailing-slash trim. A /\/+$/ regex backtracks quadratically
+// on a long run of slashes, and the Origin header is caller-controlled.
+function trimTrailingSlashes(value: string): string {
+    let end = value.length;
+    while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1;
+    return value.slice(0, end);
+}
+
 export async function createApp(options: CreateAppOptions): Promise<FastifyInstance> {
     const app = Fastify({ logger: options.logger ?? false, bodyLimit: 50 * 1024 * 1024 });
     await app.register(formbody);
@@ -119,9 +127,9 @@ export async function createApp(options: CreateAppOptions): Promise<FastifyInsta
         const origin = request.headers.origin;
         if (!origin) return csrfBlocked(reply);
         const configured = [process.env.PUBLIC_ORIGIN, ...(process.env.PHONE_FARM_TRUSTED_ORIGINS ?? '').split(',')]
-            .map((value) => value?.trim().replace(/\/+$/, '')).filter((value): value is string => Boolean(value));
+            .map((value) => value && trimTrailingSlashes(value.trim())).filter((value): value is string => Boolean(value));
         if (configured.length) {
-            if (!configured.includes(origin.replace(/\/+$/, ''))) return csrfBlocked(reply);
+            if (!configured.includes(trimTrailingSlashes(origin))) return csrfBlocked(reply);
             return;
         }
         // Nothing configured: same-origin only, compared by host (ignoring
